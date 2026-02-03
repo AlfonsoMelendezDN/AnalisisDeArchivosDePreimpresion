@@ -1,0 +1,7 @@
+# CODEOWNERS - Define code owners for this repository
+
+# These users will be automatically requested for review when a pull request modifies code they own.
+
+# Global owners - these users will be requested for review on all changes
+
+- @AlfonsoMelendezDN @Ignarts
