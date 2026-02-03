@@ -1,0 +1,3 @@
+# CODEOWNERS
+# Default code owners for the repository
+* @AlfonsoMelendezDN @Ignarts
