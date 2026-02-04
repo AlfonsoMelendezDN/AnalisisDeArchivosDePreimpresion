@@ -9,13 +9,37 @@ function pxToMm(px, dpi) {
   return Math.round((px / dpi) * 25.4 * 10) / 10;
 }
 
+// Convert any buffer type to Uint8Array (browser compatible)
+function toUint8Array(buffer) {
+  if (buffer instanceof Uint8Array) {
+    return buffer;
+  }
+  if (buffer instanceof ArrayBuffer) {
+    return new Uint8Array(buffer);
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(buffer)) {
+    return new Uint8Array(buffer);
+  }
+  return new Uint8Array(buffer);
+}
+
+// Convert Uint8Array to string (browser compatible replacement for Buffer.toString)
+function bytesToString(bytes, start, end) {
+  const slice = bytes.slice(start, end);
+  let str = '';
+  for (let i = 0; i < slice.length; i++) {
+    str += String.fromCharCode(slice[i]);
+  }
+  return str;
+}
+
 // Minimum font size for newspaper print legibility (in points)
 const MIN_FONT_SIZE_NEWSPAPER = 6;
 
 // PDF Analyzer
 function analyzePDF(buffer, fileName) {
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  const text = bytes.toString('latin1');
+  const bytes = toUint8Array(buffer);
+  const text = bytesToString(bytes, 0, bytes.length);
 
   // Find MediaBox for dimensions
   let width = 595;  // Default A4
@@ -65,7 +89,7 @@ function analyzePDF(buffer, fileName) {
   if (fontSizeMatches) {
     fontSizeMatches.forEach(match => {
       const size = parseFloat(match.match(/(\d+\.?\d*)/)[1]);
-      if (size > 0 && size < 200) { // Reasonable font size range
+      if (size > 0 && size < 200) {
         fontSizes.push(size);
       }
     });
@@ -117,7 +141,6 @@ function analyzePDF(buffer, fileName) {
     recommendations.push('Convertir a perfil ISONewspaper o Euroestándar');
   }
 
-  // Add text readability issues
   if (!textReadability.isLegible) {
     issues.push('Texto con tamaño insuficiente para impresión en papel prensa');
     recommendations.push(`Aumentar tamaño de fuente a mínimo ${MIN_FONT_SIZE_NEWSPAPER}pt para garantizar legibilidad`);
@@ -161,7 +184,7 @@ function analyzePDF(buffer, fileName) {
 
 // JPG Analyzer
 function analyzeJPG(buffer, fileName) {
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const bytes = toUint8Array(buffer);
   let width = 0;
   let height = 0;
   let dpiX = 72;
@@ -170,6 +193,7 @@ function analyzeJPG(buffer, fileName) {
   let hasICCProfile = false;
   let iccProfile = undefined;
   let dpiDetected = false;
+  let dpiSource = '';
 
   let offset = 0;
 
@@ -180,124 +204,191 @@ function analyzeJPG(buffer, fileName) {
 
   offset = 2;
 
+  // Helper to read big-endian uint16
+  const readBE16 = (pos) => (bytes[pos] << 8) | bytes[pos + 1];
+
   while (offset < bytes.length - 1) {
+    // Find next marker
     if (bytes[offset] !== 0xFF) {
       offset++;
       continue;
     }
 
+    // Skip padding FF bytes
+    while (offset < bytes.length - 1 && bytes[offset + 1] === 0xFF) {
+      offset++;
+    }
+
+    if (offset >= bytes.length - 1) break;
+
     const marker = bytes[offset + 1];
 
-    if (marker === 0xD9) break; // EOI
+    // End of image
+    if (marker === 0xD9) break;
 
+    // Standalone markers (no length)
     if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
       offset += 2;
       continue;
     }
 
-    const segmentLength = (bytes[offset + 2] << 8) | bytes[offset + 3];
+    // Read segment length
+    if (offset + 3 >= bytes.length) break;
+    const segmentLength = readBE16(offset + 2);
+    if (segmentLength < 2) {
+      offset += 2;
+      continue;
+    }
+
+    const segmentStart = offset + 4; // After marker and length
+    const segmentEnd = Math.min(offset + 2 + segmentLength, bytes.length);
 
     // APP0 - JFIF
-    if (marker === 0xE0) {
-      const jfifId = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
-      if (jfifId === 'JFIF') {
-        const units = bytes[offset + 11];
-        dpiX = (bytes[offset + 12] << 8) | bytes[offset + 13];
-        dpiY = (bytes[offset + 14] << 8) | bytes[offset + 15];
+    if (marker === 0xE0 && segmentEnd >= segmentStart + 12) {
+      const sig = String.fromCharCode(bytes[segmentStart], bytes[segmentStart + 1],
+                                       bytes[segmentStart + 2], bytes[segmentStart + 3],
+                                       bytes[segmentStart + 4]);
+      if (sig === 'JFIF\0') {
+        const units = bytes[segmentStart + 7];
+        const densityX = readBE16(segmentStart + 8);
+        const densityY = readBE16(segmentStart + 10);
 
-        if (units === 1) {
+        // units: 0 = aspect ratio only, 1 = dots per inch, 2 = dots per cm
+        if (units === 1 && densityX > 0 && densityX <= 10000) {
+          dpiX = densityX;
+          dpiY = densityY > 0 ? densityY : densityX;
           dpiDetected = true;
-        } else if (units === 2) {
-          dpiX = Math.round(dpiX * 2.54);
-          dpiY = Math.round(dpiY * 2.54);
+          dpiSource = 'JFIF';
+        } else if (units === 2 && densityX > 0 && densityX <= 10000) {
+          dpiX = Math.round(densityX * 2.54);
+          dpiY = Math.round((densityY > 0 ? densityY : densityX) * 2.54);
           dpiDetected = true;
+          dpiSource = 'JFIF';
         }
+        // units === 0 means aspect ratio only, not real DPI - continue looking
       }
     }
 
-    // APP1 - EXIF
-    if (marker === 0xE1) {
-      const exifId = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
-      if (exifId === 'Exif') {
-        const tiffOffset = offset + 10;
-        const byteOrder = (bytes[tiffOffset] << 8) | bytes[tiffOffset + 1];
-        const littleEndian = byteOrder === 0x4949;
+    // APP1 - EXIF (only parse if we haven't found DPI yet or to potentially override JFIF)
+    if (marker === 0xE1 && segmentEnd >= segmentStart + 8) {
+      const sig = String.fromCharCode(bytes[segmentStart], bytes[segmentStart + 1],
+                                       bytes[segmentStart + 2], bytes[segmentStart + 3],
+                                       bytes[segmentStart + 4], bytes[segmentStart + 5]);
+      if (sig === 'Exif\0\0') {
+        const tiffStart = segmentStart + 6;
 
-        const readUint16 = (pos) => {
-          return littleEndian
-            ? bytes[pos] | (bytes[pos + 1] << 8)
-            : (bytes[pos] << 8) | bytes[pos + 1];
-        };
+        if (tiffStart + 8 < segmentEnd) {
+          // Check byte order
+          const byteOrderMark = readBE16(tiffStart);
+          const littleEndian = byteOrderMark === 0x4949; // 'II'
+          const bigEndian = byteOrderMark === 0x4D4D; // 'MM'
 
-        const readUint32 = (pos) => {
-          return littleEndian
-            ? bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24)
-            : (bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3];
-        };
+          if (littleEndian || bigEndian) {
+            const readU16 = (pos) => {
+              if (pos + 1 >= bytes.length) return 0;
+              return littleEndian
+                ? (bytes[pos] | (bytes[pos + 1] << 8))
+                : ((bytes[pos] << 8) | bytes[pos + 1]);
+            };
 
-        try {
-          const ifdOffset = readUint32(tiffOffset + 4);
-          const numEntries = readUint16(tiffOffset + ifdOffset);
+            const readU32 = (pos) => {
+              if (pos + 3 >= bytes.length) return 0;
+              return littleEndian
+                ? (bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24)) >>> 0
+                : (((bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3])) >>> 0;
+            };
 
-          let exifDpiX = null;
-          let exifDpiY = null;
-          let exifResolutionUnit = 2; // Default: inches
+            try {
+              // Check TIFF magic number (42)
+              const magic = readU16(tiffStart + 2);
+              if (magic === 42) {
+                const ifdOffsetRel = readU32(tiffStart + 4);
+                const ifdOffset = tiffStart + ifdOffsetRel;
 
-          // Primera pasada: leer todos los tags necesarios
-          for (let i = 0; i < numEntries; i++) {
-            const entryOffset = tiffOffset + ifdOffset + 2 + (i * 12);
-            const tag = readUint16(entryOffset);
+                if (ifdOffset + 2 < segmentEnd && ifdOffsetRel < 65536) {
+                  const numEntries = readU16(ifdOffset);
 
-            if (tag === 296) { // ResolutionUnit
-              exifResolutionUnit = readUint16(entryOffset + 8);
-            } else if (tag === 282 || tag === 283) { // XResolution / YResolution
-              const valueOffset = readUint32(entryOffset + 8);
-              const numerator = readUint32(tiffOffset + valueOffset);
-              const denominator = readUint32(tiffOffset + valueOffset + 4);
-              if (denominator > 0 && numerator > 0) {
-                const resolution = numerator / denominator;
-                if (tag === 282) exifDpiX = resolution;
-                else exifDpiY = resolution;
+                  if (numEntries > 0 && numEntries < 200) {
+                    let exifDpiX = null;
+                    let exifDpiY = null;
+                    let exifResUnit = 2; // Default: inches
+
+                    for (let i = 0; i < numEntries; i++) {
+                      const entryPos = ifdOffset + 2 + (i * 12);
+                      if (entryPos + 12 > segmentEnd) break;
+
+                      const tag = readU16(entryPos);
+                      const type = readU16(entryPos + 2);
+                      const count = readU32(entryPos + 4);
+
+                      // ResolutionUnit (tag 296, type SHORT)
+                      if (tag === 296 && type === 3) {
+                        exifResUnit = readU16(entryPos + 8);
+                      }
+
+                      // XResolution (tag 282) or YResolution (tag 283), type RATIONAL (5)
+                      if ((tag === 282 || tag === 283) && type === 5 && count === 1) {
+                        const valueOffsetRel = readU32(entryPos + 8);
+                        const valuePos = tiffStart + valueOffsetRel;
+
+                        if (valuePos + 8 <= segmentEnd && valueOffsetRel < 65536) {
+                          const numerator = readU32(valuePos);
+                          const denominator = readU32(valuePos + 4);
+
+                          if (denominator > 0 && numerator > 0) {
+                            const res = numerator / denominator;
+                            if (res >= 1 && res <= 10000) {
+                              if (tag === 282) exifDpiX = res;
+                              else exifDpiY = res;
+                            }
+                          }
+                        }
+                      }
+                    }
+
+                    // Apply unit conversion and use values
+                    if (exifDpiX !== null || exifDpiY !== null) {
+                      // ResolutionUnit: 1 = no unit, 2 = inches, 3 = centimeters
+                      if (exifResUnit === 3) {
+                        if (exifDpiX !== null) exifDpiX *= 2.54;
+                        if (exifDpiY !== null) exifDpiY *= 2.54;
+                      }
+
+                      // EXIF resolution overrides JFIF if valid
+                      if (exifDpiX !== null && exifDpiX >= 1 && exifDpiX <= 10000) {
+                        dpiX = Math.round(exifDpiX);
+                        dpiDetected = true;
+                        dpiSource = 'EXIF';
+                      }
+                      if (exifDpiY !== null && exifDpiY >= 1 && exifDpiY <= 10000) {
+                        dpiY = Math.round(exifDpiY);
+                        dpiDetected = true;
+                        dpiSource = 'EXIF';
+                      }
+                    }
+                  }
+                }
               }
+            } catch (e) {
+              // EXIF parsing error, continue
             }
           }
-
-          // Aplicar conversión de unidades y validar
-          if (exifDpiX !== null || exifDpiY !== null) {
-            // Convertir de cm a inches si es necesario (unit 3 = centimeters)
-            if (exifResolutionUnit === 3) {
-              if (exifDpiX !== null) exifDpiX = exifDpiX * 2.54;
-              if (exifDpiY !== null) exifDpiY = exifDpiY * 2.54;
-            }
-
-            // Solo usar valores EXIF si son razonables (entre 1 y 10000 dpi)
-            // y si no tenemos ya valores detectados de JFIF
-            if (!dpiDetected) {
-              if (exifDpiX !== null && exifDpiX >= 1 && exifDpiX <= 10000) {
-                dpiX = Math.round(exifDpiX);
-                dpiDetected = true;
-              }
-              if (exifDpiY !== null && exifDpiY >= 1 && exifDpiY <= 10000) {
-                dpiY = Math.round(exifDpiY);
-                dpiDetected = true;
-              }
-            }
-          }
-        } catch (e) {
-          // EXIF parsing failed, continue with JFIF values if available
         }
       }
     }
 
     // APP2 - ICC Profile
-    if (marker === 0xE2) {
-      const iccId = String.fromCharCode(
-        bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
-        bytes[offset + 8], bytes[offset + 9], bytes[offset + 10], bytes[offset + 11]
+    if (marker === 0xE2 && segmentEnd >= segmentStart + 14) {
+      const sig = String.fromCharCode(
+        bytes[segmentStart], bytes[segmentStart + 1], bytes[segmentStart + 2],
+        bytes[segmentStart + 3], bytes[segmentStart + 4], bytes[segmentStart + 5],
+        bytes[segmentStart + 6], bytes[segmentStart + 7], bytes[segmentStart + 8],
+        bytes[segmentStart + 9], bytes[segmentStart + 10], bytes[segmentStart + 11]
       );
-      if (iccId.startsWith('ICC_PROF')) {
+      if (sig.startsWith('ICC_PROFILE\0')) {
         hasICCProfile = true;
-        const profileData = bytes.slice(offset + 18, offset + 2 + segmentLength).toString('latin1');
+        // Try to identify profile name
+        const profileData = bytesToString(bytes, segmentStart + 14, segmentEnd);
         if (profileData.includes('ISONewspaper') || profileData.includes('ISOnewspaper')) {
           iccProfile = 'ISONewspaper';
         } else if (profileData.includes('Eurostandard') || profileData.includes('EuroStandard')) {
@@ -306,110 +397,115 @@ function analyzeJPG(buffer, fileName) {
           iccProfile = 'sRGB';
         } else if (profileData.includes('AdobeRGB') || profileData.includes('Adobe RGB')) {
           iccProfile = 'Adobe RGB';
+        } else if (profileData.includes('Display P3')) {
+          iccProfile = 'Display P3';
         } else if (profileData.includes('CMYK')) {
           iccProfile = 'CMYK Profile';
         }
       }
     }
 
-    // APP13 - Photoshop (8BIM resources with Resolution Info)
-    if (marker === 0xED && !dpiDetected) {
-      const psId = String.fromCharCode(
-        bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
-        bytes[offset + 8], bytes[offset + 9], bytes[offset + 10], bytes[offset + 11],
-        bytes[offset + 12], bytes[offset + 13]
+    // APP13 - Photoshop IRB (Image Resource Blocks)
+    if (marker === 0xED && !dpiDetected && segmentEnd >= segmentStart + 14) {
+      const sig = String.fromCharCode(
+        bytes[segmentStart], bytes[segmentStart + 1], bytes[segmentStart + 2],
+        bytes[segmentStart + 3], bytes[segmentStart + 4], bytes[segmentStart + 5],
+        bytes[segmentStart + 6], bytes[segmentStart + 7], bytes[segmentStart + 8],
+        bytes[segmentStart + 9], bytes[segmentStart + 10], bytes[segmentStart + 11],
+        bytes[segmentStart + 12], bytes[segmentStart + 13]
       );
-      if (psId.startsWith('Photoshop')) {
-        const segmentData = bytes.slice(offset + 4, offset + 2 + segmentLength);
-        let pos = 0;
 
-        // Search for 8BIM resources
-        while (pos < segmentData.length - 12) {
-          // Look for "8BIM" signature
-          if (segmentData[pos] === 0x38 && segmentData[pos + 1] === 0x42 &&
-              segmentData[pos + 2] === 0x49 && segmentData[pos + 3] === 0x4D) {
+      if (sig.startsWith('Photoshop 3.0\0')) {
+        let pos = segmentStart + 14;
 
-            const resourceId = (segmentData[pos + 4] << 8) | segmentData[pos + 5];
-
-            // Resource ID 0x03ED (1005) = Resolution Info
-            if (resourceId === 0x03ED) {
-              // Skip pascal string name (1 byte length + string + padding to even)
-              const nameLen = segmentData[pos + 6] || 0;
-              const paddedNameLen = nameLen + (nameLen % 2 === 0 ? 1 : 0) + 1;
-              const dataStart = pos + 6 + paddedNameLen;
-
-              if (dataStart + 8 <= segmentData.length) {
-                // hRes is Fixed 16.16 format (4 bytes)
-                const hResRaw = (segmentData[dataStart + 4] << 24) |
-                                (segmentData[dataStart + 5] << 16) |
-                                (segmentData[dataStart + 6] << 8) |
-                                segmentData[dataStart + 7];
-                const hRes = hResRaw / 65536;
-
-                // hResUnit: 1 = pixels/inch, 2 = pixels/cm
-                const hResUnit = (segmentData[dataStart + 8] << 8) | segmentData[dataStart + 9];
-
-                // vRes is at offset +10 (4 bytes Fixed 16.16)
-                if (dataStart + 14 <= segmentData.length) {
-                  const vResRaw = (segmentData[dataStart + 10] << 24) |
-                                  (segmentData[dataStart + 11] << 16) |
-                                  (segmentData[dataStart + 12] << 8) |
-                                  segmentData[dataStart + 13];
-                  const vRes = vResRaw / 65536;
-
-                  if (hRes >= 1 && hRes <= 10000) {
-                    dpiX = hResUnit === 2 ? Math.round(hRes * 2.54) : Math.round(hRes);
-                    dpiDetected = true;
-                  }
-                  if (vRes >= 1 && vRes <= 10000) {
-                    dpiY = hResUnit === 2 ? Math.round(vRes * 2.54) : Math.round(vRes);
-                    dpiDetected = true;
-                  }
-                }
-              }
-              break; // Found resolution info, stop searching
-            }
-
-            // Move to next 8BIM resource
-            const nLen = segmentData[pos + 6] || 0;
-            const pLen = nLen + (nLen % 2 === 0 ? 1 : 0) + 1;
-            const dStart = pos + 6 + pLen;
-            if (dStart + 4 > segmentData.length) break;
-            const dSize = (segmentData[dStart] << 24) | (segmentData[dStart + 1] << 16) |
-                          (segmentData[dStart + 2] << 8) | segmentData[dStart + 3];
-            const padding = dSize % 2;
-            pos = dStart + 4 + dSize + padding;
-          } else {
+        // Parse 8BIM resources
+        while (pos + 12 < segmentEnd) {
+          // Look for 8BIM signature
+          if (bytes[pos] !== 0x38 || bytes[pos + 1] !== 0x42 ||
+              bytes[pos + 2] !== 0x49 || bytes[pos + 3] !== 0x4D) {
             pos++;
+            continue;
           }
+
+          const resourceId = readBE16(pos + 4);
+
+          // Pascal string (name) - first byte is length
+          const nameLen = bytes[pos + 6];
+          // Padded to even length (including length byte)
+          const paddedNameLen = (nameLen + 1 + 1) & ~1;
+
+          const dataSizePos = pos + 6 + paddedNameLen;
+          if (dataSizePos + 4 > segmentEnd) break;
+
+          const dataSize = (bytes[dataSizePos] << 24) | (bytes[dataSizePos + 1] << 16) |
+                           (bytes[dataSizePos + 2] << 8) | bytes[dataSizePos + 3];
+          const dataPos = dataSizePos + 4;
+
+          // Resource 0x03ED = Resolution Info
+          if (resourceId === 0x03ED && dataPos + 16 <= segmentEnd) {
+            // Resolution info structure:
+            // 4 bytes: hRes (Fixed 16.16)
+            // 2 bytes: hResUnit (1=pixels/inch, 2=pixels/cm)
+            // 2 bytes: widthUnit
+            // 4 bytes: vRes (Fixed 16.16)
+            // 2 bytes: vResUnit
+            // 2 bytes: heightUnit
+
+            const hResFixed = (bytes[dataPos] << 24) | (bytes[dataPos + 1] << 16) |
+                              (bytes[dataPos + 2] << 8) | bytes[dataPos + 3];
+            const hRes = hResFixed / 65536;
+            const hResUnit = readBE16(dataPos + 4);
+
+            const vResFixed = (bytes[dataPos + 8] << 24) | (bytes[dataPos + 9] << 16) |
+                              (bytes[dataPos + 10] << 8) | bytes[dataPos + 11];
+            const vRes = vResFixed / 65536;
+
+            if (hRes >= 1 && hRes <= 10000) {
+              // hResUnit: 1 = pixels/inch, 2 = pixels/cm
+              dpiX = hResUnit === 2 ? Math.round(hRes * 2.54) : Math.round(hRes);
+              dpiDetected = true;
+              dpiSource = 'Photoshop';
+            }
+            if (vRes >= 1 && vRes <= 10000) {
+              dpiY = hResUnit === 2 ? Math.round(vRes * 2.54) : Math.round(vRes);
+              dpiDetected = true;
+              dpiSource = 'Photoshop';
+            }
+            break;
+          }
+
+          // Move to next resource (data is padded to even length)
+          const paddedDataSize = (dataSize + 1) & ~1;
+          pos = dataPos + paddedDataSize;
         }
       }
     }
 
-    // SOF markers (Start of Frame)
+    // SOF markers (Start of Frame) - Get dimensions and color info
     if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) ||
         (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
-      height = (bytes[offset + 5] << 8) | bytes[offset + 6];
-      width = (bytes[offset + 7] << 8) | bytes[offset + 8];
-      const components = bytes[offset + 9];
+      if (segmentEnd >= segmentStart + 6) {
+        height = readBE16(segmentStart + 1);
+        width = readBE16(segmentStart + 3);
+        const components = bytes[segmentStart + 5];
 
-      if (components === 1) {
-        colorSpace = 'Grayscale';
-      } else if (components === 3) {
-        colorSpace = 'RGB';
-      } else if (components === 4) {
-        colorSpace = 'CMYK';
+        if (components === 1) {
+          colorSpace = 'Grayscale';
+        } else if (components === 3) {
+          colorSpace = 'RGB';
+        } else if (components === 4) {
+          colorSpace = 'CMYK';
+        }
       }
     }
 
+    // Move to next segment
     offset += 2 + segmentLength;
   }
 
   const dpi = Math.max(dpiX, dpiY);
 
   // Analyze text readability for raster images
-  // For raster images, readability depends on resolution
-  // Text in images below 200 dpi will likely not be legible in newspaper print
   let textReadability = { isLegible: true, status: 'legible', details: [] };
 
   if (dpi < 150) {
@@ -446,7 +542,6 @@ function analyzeJPG(buffer, fileName) {
     recommendations.push('Convertir a perfil ISONewspaper o Euroestándar');
   }
 
-  // Add text readability warning if needed
   if (!textReadability.isLegible) {
     issues.push('Resolución insuficiente para texto legible en impresión');
   }
@@ -492,19 +587,21 @@ function analyzeJPG(buffer, fileName) {
 
 // TIFF Analyzer
 function analyzeTIFF(buffer, fileName) {
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const bytes = toUint8Array(buffer);
 
   // Check byte order
   const byteOrder = (bytes[0] << 8) | bytes[1];
   const littleEndian = byteOrder === 0x4949;
 
   const readUint16 = (pos) => {
+    if (pos + 1 >= bytes.length) return 0;
     return littleEndian
       ? bytes[pos] | (bytes[pos + 1] << 8)
       : (bytes[pos] << 8) | bytes[pos + 1];
   };
 
   const readUint32 = (pos) => {
+    if (pos + 3 >= bytes.length) return 0;
     return littleEndian
       ? bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24)
       : (bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3];
@@ -529,8 +626,10 @@ function analyzeTIFF(buffer, fileName) {
   let iccProfile = undefined;
   let dpiDetected = false;
 
-  for (let i = 0; i < numEntries; i++) {
+  for (let i = 0; i < numEntries && i < 100; i++) {
     const entryOffset = ifdOffset + 2 + (i * 12);
+    if (entryOffset + 12 > bytes.length) break;
+
     const tag = readUint16(entryOffset);
     const type = readUint16(entryOffset + 2);
     const count = readUint32(entryOffset + 4);
@@ -548,19 +647,23 @@ function analyzeTIFF(buffer, fileName) {
     // XResolution (282)
     if (tag === 282) {
       const valueOffset = readUint32(entryOffset + 8);
-      const numerator = readUint32(valueOffset);
-      const denominator = readUint32(valueOffset + 4);
-      dpiX = denominator > 0 ? Math.round(numerator / denominator) : 72;
-      dpiDetected = true;
+      if (valueOffset + 8 <= bytes.length) {
+        const numerator = readUint32(valueOffset);
+        const denominator = readUint32(valueOffset + 4);
+        dpiX = denominator > 0 ? Math.round(numerator / denominator) : 72;
+        dpiDetected = true;
+      }
     }
 
     // YResolution (283)
     if (tag === 283) {
       const valueOffset = readUint32(entryOffset + 8);
-      const numerator = readUint32(valueOffset);
-      const denominator = readUint32(valueOffset + 4);
-      dpiY = denominator > 0 ? Math.round(numerator / denominator) : 72;
-      dpiDetected = true;
+      if (valueOffset + 8 <= bytes.length) {
+        const numerator = readUint32(valueOffset);
+        const denominator = readUint32(valueOffset + 4);
+        dpiY = denominator > 0 ? Math.round(numerator / denominator) : 72;
+        dpiDetected = true;
+      }
     }
 
     // ResolutionUnit (296)
@@ -581,7 +684,8 @@ function analyzeTIFF(buffer, fileName) {
       hasICCProfile = true;
       try {
         const profileOffset = readUint32(entryOffset + 8);
-        const profileData = bytes.slice(profileOffset, profileOffset + Math.min(count, 500)).toString('latin1');
+        const profileEnd = Math.min(profileOffset + count, profileOffset + 500, bytes.length);
+        const profileData = bytesToString(bytes, profileOffset, profileEnd);
         if (profileData.includes('ISONewspaper') || profileData.includes('ISOnewspaper')) {
           iccProfile = 'ISONewspaper';
         } else if (profileData.includes('Eurostandard') || profileData.includes('EuroStandard')) {
@@ -641,7 +745,6 @@ function analyzeTIFF(buffer, fileName) {
     recommendations.push('Se recomienda embeber perfil ICC apropiado');
   }
 
-  // Add text readability warning if needed
   if (!textReadability.isLegible) {
     issues.push('Resolución insuficiente para texto legible en impresión');
   }
@@ -687,8 +790,8 @@ function analyzeTIFF(buffer, fileName) {
 
 // EPS Analyzer
 function analyzeEPS(buffer, fileName) {
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  const text = bytes.toString('latin1');
+  const bytes = toUint8Array(buffer);
+  const text = bytesToString(bytes, 0, bytes.length);
 
   // Extract BoundingBox
   let width = 0;
@@ -770,9 +873,22 @@ function analyzeEPS(buffer, fileName) {
   };
 }
 
-module.exports = {
-  analyzePDF,
-  analyzeJPG,
-  analyzeTIFF,
-  analyzeEPS
-};
+// Export for both Node.js and browser
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    analyzePDF,
+    analyzeJPG,
+    analyzeTIFF,
+    analyzeEPS
+  };
+}
+
+// Make available globally in browser
+if (typeof window !== 'undefined') {
+  window.Analyzers = {
+    analyzePDF,
+    analyzeJPG,
+    analyzeTIFF,
+    analyzeEPS
+  };
+}

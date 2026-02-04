@@ -1,58 +1,10 @@
 {
   "name": "analisis-archivos-preimpresion",
-  "version": "1.1.0",
-  "description": "Aplicación de escritorio para análisis y validación de archivos de preimpresión para papel prensa",
+  "version": "1.2.0",
+  "description": "Aplicación web para análisis y validación de archivos de preimpresión para papel prensa",
   "author": "A. Meléndez",
   "license": "UNLICENSED",
-  "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "build": "electron-builder",
-    "build:mac": "electron-builder --mac",
-    "build:win": "electron-builder --win",
-    "build:all": "electron-builder --mac --win"
-  },
-  "build": {
-    "appId": "com.amelendez.analisis-preimpresion",
-    "productName": "Análisis de Preimpresión",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "main.js",
-      "preload.js",
-      "src/**/*"
-    ],
-    "mac": {
-      "category": "public.app-category.graphics-design",
-      "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        }
-      ]
-    },
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
-    }
-  },
-  "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.9.1"
-  },
-  "packageManager": "yarn@3.6.1+sha512.de524adec81a6c3d7a26d936d439d2832e351cdfc5728f9d91f3fc85dd20b04391c038e9b4ecab11cae2b0dd9f0d55fd355af766bc5c1a7f8d25d96bb2a0b2ca"
+    "start": "npx serve src"
+  }
 }

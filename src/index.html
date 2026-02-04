@@ -3,18 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data:;">
   <title>Análisis de Archivos de Preimpresión</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <style>
-    body {
-      -webkit-app-region: drag;
-    }
-    button, input, .drop-zone, .no-drag {
-      -webkit-app-region: no-drag;
-    }
     .drop-zone {
       transition: all 0.3s ease;
     }
@@ -36,7 +29,7 @@
 <body class="bg-gray-50 min-h-screen">
   <div class="max-w-4xl mx-auto p-4 pt-8">
     <!-- Header -->
-    <header class="flex items-center gap-4 mb-6 no-drag">
+    <header class="flex items-center gap-4 mb-6">
       <div class="text-4xl font-bold text-gray-800">
         <span class="border-b-4 border-gray-800">DN</span>
       </div>
@@ -47,7 +40,7 @@
     </header>
 
     <!-- Technical Specifications Panel -->
-    <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 no-drag">
+    <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
       <div class="flex items-start gap-2">
         <i class="fas fa-info-circle text-blue-500 mt-1"></i>
         <div class="text-sm">
@@ -63,7 +56,7 @@
     </div>
 
     <!-- Drop Zone -->
-    <div id="dropZone" class="drop-zone border-2 border-dashed border-gray-300 rounded-lg p-12 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 mb-6 no-drag">
+    <div id="dropZone" class="drop-zone border-2 border-dashed border-gray-300 rounded-lg p-12 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 mb-6">
       <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 mb-3"></i>
       <p class="text-gray-600 font-medium">Arrastra tu archivo aquí</p>
       <p class="text-gray-400 text-sm">o haz clic para seleccionar</p>
@@ -71,7 +64,7 @@
     </div>
 
     <!-- Progress Bar -->
-    <div id="progressContainer" class="hidden mb-6 no-drag">
+    <div id="progressContainer" class="hidden mb-6">
       <div class="flex items-center justify-between mb-2">
         <span class="text-sm text-gray-600">Analizando archivo...</span>
         <span id="progressText" class="text-sm text-gray-600">0%</span>
@@ -82,7 +75,7 @@
     </div>
 
     <!-- Results Section -->
-    <div id="resultsSection" class="hidden no-drag">
+    <div id="resultsSection" class="hidden">
       <!-- File Info Card -->
       <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-4">
         <h2 class="text-lg font-semibold text-gray-800 mb-3 flex items-center gap-2">
@@ -215,11 +208,12 @@
     </div>
 
     <!-- Footer -->
-    <footer class="text-center text-gray-400 text-xs mt-8 pb-4 no-drag">
+    <footer class="text-center text-gray-400 text-xs mt-8 pb-4">
       ©A. Meléndez, 2026 rev.1
     </footer>
   </div>
 
+  <script src="analyzers.js"></script>
   <script>
     // Initialize PDF.js worker
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -230,14 +224,18 @@
     const progressText = document.getElementById('progressText');
     const resultsSection = document.getElementById('resultsSection');
 
-    let currentFilePath = null;
-
     // Click to open file dialog
-    dropZone.addEventListener('click', async () => {
-      const filePath = await window.electronAPI.openFileDialog();
-      if (filePath) {
-        handleFile(filePath);
-      }
+    dropZone.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.pdf,.jpg,.jpeg,.tif,.tiff,.eps';
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          handleFile(file);
+        }
+      };
+      input.click();
     });
 
     // Drag and drop handlers
@@ -260,13 +258,16 @@
 
       const files = e.dataTransfer.files;
       if (files.length > 0) {
-        const filePath = files[0].path;
-        handleFile(filePath);
+        handleFile(files[0]);
       }
     });
 
-    async function handleFile(filePath) {
-      currentFilePath = filePath;
+    async function handleFile(file) {
+      if (!window.Analyzers) {
+        alert('Error: Analizadores no disponibles');
+        return;
+      }
+
       resultsSection.classList.add('hidden');
       progressContainer.classList.remove('hidden');
 
@@ -279,18 +280,44 @@
       }, 100);
 
       try {
-        const response = await window.electronAPI.analyzeFile(filePath);
+        // Read file as ArrayBuffer
+        const arrayBuffer = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsArrayBuffer(file);
+        });
 
         clearInterval(progressInterval);
-        updateProgress(100);
 
-        if (!response.success) {
-          throw new Error(response.error);
+        // Get extension
+        const extension = file.name.split('.').pop().toLowerCase();
+
+        let result;
+        switch (extension) {
+          case 'pdf':
+            result = window.Analyzers.analyzePDF(arrayBuffer, file.name);
+            break;
+          case 'jpg':
+          case 'jpeg':
+            result = window.Analyzers.analyzeJPG(arrayBuffer, file.name);
+            break;
+          case 'tif':
+          case 'tiff':
+            result = window.Analyzers.analyzeTIFF(arrayBuffer, file.name);
+            break;
+          case 'eps':
+            result = window.Analyzers.analyzeEPS(arrayBuffer, file.name);
+            break;
+          default:
+            throw new Error(`Formato no soportado: ${extension}`);
         }
+
+        updateProgress(100);
 
         setTimeout(() => {
           progressContainer.classList.add('hidden');
-          displayResults(response.data, filePath);
+          displayResults(result, file);
         }, 300);
 
       } catch (error) {
@@ -305,7 +332,7 @@
       progressText.textContent = Math.round(value) + '%';
     }
 
-    async function displayResults(result, filePath) {
+    async function displayResults(result, file) {
       // File info
       document.getElementById('fileName').textContent = result.fileName;
       document.getElementById('fileType').textContent = result.fileType;
@@ -438,42 +465,41 @@
       }
 
       // Preview
-      await generatePreview(filePath, result.fileType);
+      await generatePreview(file, result.fileType);
 
       resultsSection.classList.remove('hidden');
     }
 
-    async function generatePreview(filePath, fileType) {
+    async function generatePreview(file, fileType) {
       const container = document.getElementById('previewContainer');
       const label = document.getElementById('previewLabel');
 
       container.innerHTML = '<p class="text-gray-400 text-sm">Cargando vista previa...</p>';
 
       try {
-        const response = await window.electronAPI.readFileForPreview(filePath);
-
-        if (!response.success) {
-          throw new Error(response.error);
-        }
-
         container.innerHTML = '';
 
-        if (response.type === 'image') {
-          const img = document.createElement('img');
-          img.src = response.data;
-          img.className = 'max-w-full max-h-[250px] object-contain rounded';
-          img.alt = 'Vista previa';
-          container.appendChild(img);
-          label.textContent = 'Imagen JPEG';
-        } else if (response.type === 'pdf') {
+        if (['jpg', 'jpeg'].includes(fileType.toLowerCase())) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const img = document.createElement('img');
+            img.src = e.target.result;
+            img.className = 'max-w-full max-h-[250px] object-contain rounded';
+            img.alt = 'Vista previa';
+            container.appendChild(img);
+            label.textContent = 'Imagen JPEG';
+          };
+          reader.readAsDataURL(file);
+        } else if (fileType.toLowerCase() === 'pdf') {
           try {
-            const pdfData = atob(response.data);
-            const pdfArray = new Uint8Array(pdfData.length);
-            for (let i = 0; i < pdfData.length; i++) {
-              pdfArray[i] = pdfData.charCodeAt(i);
-            }
+            const arrayBuffer = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = () => reject(reader.error);
+              reader.readAsArrayBuffer(file);
+            });
 
-            const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             const page = await pdf.getPage(1);
 
             const scale = 1.5;
